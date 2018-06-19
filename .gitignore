@@ -1,2 +1,11 @@
 
+*.aux
+*.dvi
+*.fdb_latexmk
+*.fls
+*.log
+*.ps
+*.synctex.gz
+*.pdf
+
 .DS_Store
