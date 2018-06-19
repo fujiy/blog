@@ -1,0 +1,310 @@
+[http://fujiy.hatenablog.com/entry/frp-tetris:title=前回]は基本的なデータ型を定義し，テトリスのフィールドを表示させた．
+
+* BehaviorをEventに変換...?
+
+前回のゲームBehaviorを整理すると，
+
+>|haskell|
+position :: Behavior (Int, Int)
+position = (\t -> (5, truncate (t / 1000) - 2)) <$> time
+
+game :: Behavior Tetris
+game = (\p -> Tetris initialField tetriminoS p 0) <$> position
+||<
+
+positionは座標のBehaviorになっている．テトリミノの位置は時間に対して連続的に変化するといえるので正しい．
+ただしここで，例えば下まで落下したことを検知したい場合厄介になる．"下まで落ちた"ことは離散的な出来事なのでEventとして表すと，BehaviorをEventに変換する関数が必要になる．
+
+>|haskell|
+dropped :: Event ()
+dropped = listen $ (> 10) . snd <$> position
+
+listen :: Behavior Bool -> Event ()
+||<
+
+listenはBehaviorの値が真になったことを検出する関数だが，どう実装すれば良いのだろう？
+Behaviorの値は連続的な時間に対して変化するため，正確には実装できそうにない．
+
+ここからは，最終的なゲーム状態はBehaviorだが，ゲーム内の状態変化は必要に応じてEventを用いることにする．
+上の例なら，テトリミノの座標が変化するイベントを用意し，そこから落下の検出（Event）や現在位置（Behavior）を求める．
+
+>|haskell|
+fall :: Event ()
+fall = atTimes [1000, 2000..]
+
+move :: Event ((Int, Int) -> (Int, Int))
+move = const (\(x, y) -> (x, y + 1)) <$> fall
+||<
+
+
+* EventをBehaviorに変換
+
+離散的なmoveイベントから，連続的な位置Behaviorに変換する関数が必要になる．
+
+>|haskell|
+stepper :: a -> Event a -> Behavior a
+stepper a (Event xs) = Behavior $ go a xs
+    where
+        go :: a -> [(Time, a)] -> Time -> a
+        go a []            _ = a
+        go a ((t', a'):xs) t = if t' < t then go a' xs t else a
+||<
+
+stepperは初期値と値のEventから，段階的に変化するBehaviorに変換する．
+この実装だと，実際に計算されるときには過去のイベントの履歴を総舐めするため効率が悪い．内部実装によって改善できるはずなので，今は気にせずこのまま進める．
+
+>|haskell|
+accum :: a -> Event (a -> a) -> Event a
+accum a (Event fs) = Event $ go a fs
+    where
+        go :: a -> [(Time, a -> a)] -> [(Time, a)]
+        go a []          = []
+        go a ((t, f):xs) = (t, f a) : go (f a) xs
+
+position :: Behavior (Int, Int)
+position = stepper (5, 0) $ accum (5, 0) move
+||<
+
+accum関数で，moveの移動量を累積し座標のEventとしている．
+stepperで座標のEventを座標のBehaviorに変換する．
+
+
+*Behaviorの切り替え
+
+落下したというイベントを定義する．
+
+>|haskell|
+filterE :: (a -> Bool) -> Event a -> Event a
+filterE f (Event xs) = Event $ filter (\(_, a) -> f a) xs
+
+once :: Event a -> Event a
+once (Event xs) = Event [head xs]
+
+dropped :: Event (Int, Int) -> Event (Int, Int)
+dropped = once . filterE (\(x, y) -> y >= 17)
+||<
+
+droppedイベントの前ではテトリミノを降下させ，後ではその場に留めればよい．
+Eventに従ってBehaviorを切り替える関数を作る．
+
+>|haskell|
+switcher :: Behavior a -> Event (Behavior a) -> Behavior a
+switcher (Behavior f) (Event xs) =
+    Behavior $ go f (map (fmap $ \(Behavior f) -> f) xs)
+    where
+        go :: (Time -> a) -> [(Time, Time -> a)] -> Time -> a
+        go f []            t = f t
+        go f ((t', f'):xs) t = if t' < t then go f' xs t else f t
+
+constB :: a -> Behavior a
+constB a = Behavior $ const a
+
+position :: Behavior (Int, Int)
+position = let pos = accum (5, 0) move
+           in  switcher (stepper (5, 0) pos)
+                        (constB <$> dropped pos)
+||<
+
+>||
+score: 0
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒          ████      ▒▒
+▒▒        ████        ▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+||<
+
+switcher関数は，初期値のBehaviorと"BehaviorのEvent"をとり，段階的にBehaviorを切り替える．
+ここでは，初期Behaviorを降下として，droppedイベントを受けてその場に留まるBehaviorに切り替わる．
+
+* 落下判定
+
+テトリスのデータ表現を少し修正する．
+
+>|haskell|
+data Tetris = Tetris {field     :: Field,
+                      tetrimino :: Tetrimino,
+                      pos       :: (Int, Int),
+                      score     :: Int}
+
+type Field     = [[Cell]]
+type Tetrimino = [(Int, Int)]
+
+merge :: (Int, Int) -> Tetrimino -> Field -> Field
+merge pos t = let ps = map (vecAdd pos) t
+              in  mapWithPos (\p c -> if p `elem` ps then B else c)
+    where
+        mapWithPos :: ((Int, Int) -> a -> b) -> [[a]] -> [[b]]
+        mapWithPos f ass = map (\(y, as) ->
+                               map (\(x, a) -> f (x, y) a) $ zip [0..] as)
+                           $ zip [0..] ass
+
+vecAdd :: (Int, Int) -> (Int, Int) -> (Int, Int)
+vecAdd (x, y) (x', y') = (x + x', y + y')
+
+tetriminoS :: Tetrimino
+tetriminoS = blocks [[E,E,E,E],
+                     [E,B,B,E],
+                     [B,B,E,E],
+                     [E,E,E,E]]
+    where
+        blocks :: [[Cell]] -> [(Int, Int)]
+        blocks cs = concatMap (\(y, xs) -> map (,y) xs) $
+                            indexed $ map (map fst . filter ((== B) . snd) . indexed) cs
+
+        indexed :: [a] -> [(Int, a)]
+        indexed = zip [0..]
+||<
+
+droppedイベントに衝突判定を使うようにする．
+
+>|haskell|
+collision :: (Int, Int) -> Tetrimino -> Field -> Bool
+collision pos t f = let ps = map (vecAdd pos) t
+                    in  any (\p -> at p f /= E) ps
+    where
+        at :: (Int, Int) -> Field -> Cell
+        at (x, y) xs = fromMaybe W (join $ atMaybe x <$> atMaybe y xs)
+
+        atMaybe :: Int -> [a] -> Maybe a
+        atMaybe _ []     = Nothing
+        atMaybe 0 (a:_)  = Just a
+        atMaybe i (_:as) = atMaybe (i - 1) as
+
+dropped :: Event (Int, Int) -> Event (Int, Int)
+dropped p = once $ vecAdd (0, -1) <$>
+              filterE (\p -> collision p tetriminoS initialField) p
+||<
+
+次のステップで地面と重なるときに落下したと判定する．
+
+* 入力
+
+キー入力によって動作が変わるようにしたい．
+
+>|haskell|
+newtype Input = Get Char
+
+inputEvent :: IO (Event Input)
+
+delay :: Time -> Event a -> Event a
+delay t (Event xs) = Event $ map (first (t +)) xs
+
+echo :: Event Input -> Event Output
+echo i = (\(Get c) -> Put c) <$> i
+
+main = do
+    hSetEcho stdin False
+    input <- inputEvent
+    run $ delay 500 $ echo input
+||<
+
+インターフェースとしては，inputEventから得た入力イベントを出力イベントに変換する形にする．
+
+>|haskell|
+import Data.Time
+
+run :: Event Output -> IO ()
+run (Event o) = do
+    utct <- getCurrentTime
+    mapM_ (\(t', o) -> do
+        t <- getTime utct
+        threadDelay . truncate $ (t' - t) * 1000
+        case o of
+            Put c -> do
+                putChar c
+                hFlush stdout
+            Clr -> clearScreen
+        ) o
+
+inputEvent :: IO (Event Input)
+inputEvent = do
+    utct <- getCurrentTime
+    let go = do
+            c <- getChar
+            t <- getTime utct
+            if c == '\n' then return []
+                         else ((t, Get c):) <$> go
+    Event <$> go
+
+getTime :: UTCTime -> IO Time
+getTime t = (* 1000) . realToFrac . flip diffUTCTime t <$> getCurrentTime
+||<
+
+inputEventは一文字ずつ入力を受けて，時間とセットでイベントとする．
+run関数も少し修正．
+
+>||
+abc
+||<
+
+入力を0.5秒遅れで表示しエンターキーで終了させたい．
+しかしIOが遅延しないために，入力が全て終わってから出力が始まるようになってしまう．
+
+ここで黒魔術を使う．
+
+>|haskell|
+import System.IO.Unsafe
+
+inputEvent :: IO (Event Input)
+inputEvent = do
+    utct <- getCurrentTime
+    let go = unsafeInterleaveIO $ do
+            c <- getChar
+            t <- getTime utct
+            if c == '\n' then return []
+                         else ((t, Get c):) <$> go
+    Event <$> go
+||<
+
+unsafeInterleaveIOは，IOの中身を遅延させることができる（もちろんunsafe）．
+これによりEventの計算が遅延されるので，入力を受けて順次出力されるようになった．
+
+ここで一つ問題がある．
+
+>|haskell|
+echo :: Event Input -> Event Output
+echo i = (\(Get c) -> Put c) <$> i
+
+putA :: Event Output
+putA = puts $ const "A" <$> atTimes [0,100..]
+
+main = do
+    hSetEcho stdin False
+    input <- inputEvent
+    run $ echo input `mappend` putA
+||<
+
+>||
+AAAaAAAAAbAAAAcAAAAA...
+||<
+
+入力をそのまま出力するechoイベントと，0.1秒おきにAと出力するputAイベントを合成しているが，echoイベントのタイミングでputAイベントの出力がまとめて表示される．合成を行うmappend関数ではイベント配列を時間で比較して並べ替えているために，片方の最新のイベントまで全体の評価が遅延してしまう．
+
+>||
+[(0, 'A'), (100, 'A'), (200, 'A'), (300, 'A'), (400, 'A'), (500, 'A'), ...
+`mappend`
+[                (150, 'a'),                   (400, 'b'), ...
+||<
+
+未来のイベントを参照することは無いので，合成した時点で評価済みかどうか判定して合成することにする．これまた黒魔術感溢れるisEvaluatedパッケージを用いた．
+
+>||
+
+||<

@@ -1,0 +1,197 @@
+
+* Haskellの型システムを書く(1)
+
+[https://qiita.com/advent-calendar/2017/haskell:title=Haskell Advent Calendar 2017] 3日目の記事です．
+
+
+Haskellの型推論器を実装し，型システムへの理解を深める．
+
+GHC拡張には型に関するものも多いが，今回は触れず標準のHaskellに従う．
+
+
+* Hindley-Milner 型推論
+
+シンプルなλ式に対する多相型推論器を考える．
+====
+
+** 構文
+
+>|haskell|
+data Expr = Var String
+          | App Expr Expr
+          | Lam String Expr
+          | Let String Expr Expr
+          | Num Int
+
+data Type = TVar TVar
+          | TCon String
+          | TArr Type Type
+type TVar = Int
+
+data Scheme = Scheme [TVar] Type
+||<
+
+式は変数・関数適用・λ式・Let束縛・リテラル，型は型変数・型コンストラクタ・関数型から成り立つ．
+
+型スキームは，forall 型変数* . 型 の形で表される．型スキームで量化された型変数は，任意の型に置き換えられることを示す．
+
+
+** 推論器
+
+>|haskell|
+type Interpreter = Reader Env
+
+data Env = Env (Map.Map String Scheme)
+
+type Infer = EitherT TypeError (StateT TypeEnv Interpreter)
+
+data TypeEnv = TypeEnv (Map.Map TVar Type) TVar
+
+data TypeError = Mismatch Type Type
+               | InfiniteType Type Type
+               | NotInScope String
+
+
+interpret :: Interpreter a -> a
+interpret m = runReader m (Env Map.empty)
+
+runInfer :: Infer a -> Interpreter (Either TypeError a)
+runInfer m = evalStateT (runEitherT m) (TypeEnv Map.empty 0)
+||<
+
+Interpreterモナドは名前空間を，Inferモナドは型環境（型変数の集合）を保持する．
+
+
+** 単一化
+
+>|haskell|
+unify :: Type -> Type -> Infer Type
+unify a b = do
+    a' <- eval a
+    b' <- eval b
+    case (a', b') of
+        (TArr ax ay, TArr bx by)  -> TArr <$> unify ax bx <*> unify ay by
+        (TCon x, TCon y) | x == y -> return a'
+        (TVar x, TVar y) | x == y -> return a'
+        (TVar x, _) -> occursCheck x b' >> bind x b'
+        (_, TVar y) -> occursCheck y a' >> bind y a'
+        _           -> left $ Mismatch a' b'
+
+occursCheck :: TVar -> Type -> Infer ()
+occursCheck i t = when (i `elem` tvars t) $ left $ InfiniteType (TVar i) t
+
+eval :: Type -> Infer Type
+eval (TVar i) = do
+    TypeEnv m _ <- get
+    maybe (return $ TVar i) eval $ Map.lookup i m
+    -- return $ fromMaybe (TVar i) $ Map.lookup i m
+eval t = return t
+
+bind :: TVar -> Type -> Infer Type
+bind i t = do
+    TypeEnv m j <- get
+    put $ TypeEnv (Map.insert i t m) j
+    return t
+
+tvars :: Type -> [TVar]
+tvars (TVar i)   = [i]
+tvars (TArr a b) = tvars a ++ tvars b
+tvars _          = []
+||<
+
+型推論は，未知の型変数に対して具体的な型を代入していくことで進める．
+
+unification（単一化）プロセスでは2つの型を比較して，片方が型変数であれば代入し，等しくなければ推論を失敗する．
+
+a と a -> Int のように型変数がもう片方に含まれている場合は，単一化が発散してしまうため必ず失敗する．これはoccursCheckで調べている．
+
+
+** 総称化・インスタンス化
+
+>|haskell|
+generalize :: TVar -> Type -> Infer Scheme
+generalize i t = do
+    t' <- eval t
+    return $ Scheme (filter (> i) $ tvars t') t'
+
+instantiate :: Scheme -> Infer Type
+instantiate (Scheme ts t) = traceShow (ts, t) $ do
+    ts' <- mapM (\i -> (i,) <$> newTVar) ts
+    return $ replace (Map.fromList ts') t
+    where
+        replace :: Map.Map TVar Type -> Type -> Type
+        replace m (TVar i)   = fromMaybe (TVar i) $ Map.lookup i m
+        replace m (TArr a b) = TArr (replace m a) (replace m b)
+        replace _ t          = t
+
+maxTVar :: Infer TVar
+maxTVar = do
+    TypeEnv m i <- get
+    return $ i - 1
+||<
+
+型変数が含まれる多相型は，関数が式に現れるごとに具体化（インスタンス化）される．
+
+generalize（総称化）では，ローカル束縛外の型環境に含まれない型変数を量化する．
+
+instantiate（具体化）では，型スキーム内の量化された変数を型環境内の新しい型変数にマップする．
+
+let式で束縛された変数は多相化されるが，lambda抽象の変数は多相化されない．
+
+>|haskell|
+(\f -> const (f True) (f 1)) (\x -> x)  -- 失敗
+let f = \x -> x in const (f True) (f 1) -- 成功
+||<
+
+
+
+** 推論
+
+>|haskell|
+infer :: Expr -> Infer Type
+infer e = eval =<< case e of
+    Var s -> do
+        Env m <- ask
+        maybe (left $ NotInScope s) instantiate $ Map.lookup s m
+    App a b -> do
+        tv <- newTVar
+        ta <- infer a
+        tb <- infer b
+        unify ta (TArr tb tv)
+        return tv
+    Lam s a -> do
+        tv <- newTVar
+        ta <- local (extend s $ Scheme [] tv) $ infer a
+        return $ TArr tv ta
+    Let s b a -> do
+        i  <- maxTVar
+        tb <- infer b >>= generalize i
+        local (extend s tb) $ infer a
+    Num _ -> return $ TCon "Int"
+
+newTVar :: Infer Type
+newTVar = do
+    TypeEnv m i <- get
+    put $ TypeEnv m (i + 1)
+    return $ TVar i
+
+extend :: String -> Scheme -> Env -> Env
+extend s t (Env m) = Env (Map.insert s t m)
+||<
+
+
+- 変数は，名前空間から取得した型をインスタンス化する．
+- 関数適用は，関数の実引数と仮引数の型をunifyし，戻り値の型を式の型とする．
+- λ抽象は，引数を名前空間に追加し，関数型とする．
+- Let式は，束縛したローカル変数を名前空間に追加し，右辺の型を返す．
+- リテラルはそれに応じた型を持つ．
+
+以上の関数を用いて式に型を付ける．
+
+
+カインド，型クラス制約等は次回に．
+
+
+* 参照
+
+[http://dev.stephendiehl.com/fun/006_hindley_milner.html#generalization-and-instantiation:title=Write You a Haskell]

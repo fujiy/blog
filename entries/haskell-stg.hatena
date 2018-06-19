@@ -1,0 +1,373 @@
+HaskellのSTG言語
+
+この記事では GHC 8.0.1 を用いています．
+
+* STG言語
+
+STG（Spinless Tagless G-machine）とは，遅延評価で高階関数をサポートする関数型言語のための抽象機械である．
+STG（Shared Term Graph(([http://d.hatena.ne.jp/kazu-yamamoto/20130417/1366179138:title=GHCのSTGに関するまとめ - あどけない話]))）言語はSTG機械のための言語で，GHCでは Haskellソース → Core言語 → STG言語 → C-- → アセンブラ，LLVM というコンパイル過程で中間言語として現れる．
+
+STG言語は，ghcで --ddump-stg オプションをつけてコンパイルすると出力される．
+
+====
+
+** Core言語
+
+[https://ghc.haskell.org/trac/ghc/wiki/Commentary/Compiler/CoreSynType:title=Core言語]は概ねHaskellのサブセットであり，脱糖したHaskellとみることができる．Haskellと異なる点は，
+- 多相関数が引数に明示的に型パラメータをとる（@ a)
+- パターンマッチはcase式でのみ可能で，ネストしたパターンは使えない．
+
+変数はリネームされ，情報が付与されている．
+
+Core言語は，ghcで --ddump-prep または -ddump-simpl（中間Core形式）オプションをつけてコンパイルすると出力される．
+
+>|haskell|
+foo :: a -> a
+foo x = x
+
+-- 中間Core
+foo :: forall a_aoY. a_aoY -> a_aoY
+[GblId, Arity=1, Caf=NoCafRefs, Str=DmdType]
+foo = \ (@ a_awd) (x_aw3 :: a_awd) -> x_aw3
+-- 中間Core（整形後）
+foo :: forall a. a -> a
+foo = \ (@ a) (x :: a) -> x
+
+-- Core
+Main.foo :: forall a_aoY. a_aoY -> a_aoY
+[GblId, Arity=1, Caf=NoCafRefs, Str=DmdType, Unf=OtherCon []]
+Main.foo = \ (@ a_awd) (x_sP3 [Occ=Once] :: a_awd) -> x_sP3
+-- Core（整形後）
+Main.foo :: forall a. a -> a
+Main.foo = \ (@ a) (x :: a) -> x
+||<
+
+
+* 構文
+
+STG言語はCore言語をさらに限定的にしたような構文をもつ．Core言語との違いは，
+- 関数やコンストラクタへの引数は必ず変数かリテラル
+- let束縛の右辺はクロージャかコンストラクタ適用のどちらか
+- 型情報は大方捨てられ，最低限が残る
+
+>|haskell|
+foo :: a -> a
+foo x = x
+
+-- STG
+Main.foo :: forall a_aoX. a_aoX -> a_aoX
+[GblId, Arity=1, Caf=NoCafRefs, Str=DmdType, Unf=OtherCon []] =
+    \r srt:SRT:[] [x_sFZ] x_sFZ;
+
+-- STG（整形後）
+Main.foo :: forall a. a -> a　=
+    \r [x] x;
+||<
+
+以降のSTG言語は断りのない限り，変数名を変えたり余計な情報を省いて整形したものとする．
+
+** クロージャ
+
+>|haskell|
+foo :: a -> a
+foo x = x
+-- STG
+Main.foo :: forall a. a -> a =
+    \r [x] x;
+||<
+
+"\"から始まるクロージャは，更新可能フラグ(r)，引数のリスト（[x]），本体（x）からなる．
+u - updatable 更新可能（thunk） 評価されるとその結果に書き換えられる
+r - re-entrant 再入可能（関数）引数をとる
+s - single-entry 再入不可（IO関係）
+
+** コンストラクタ
+
+コンストラクタへの引数はリストで表され，引数が全て埋まっている必要がある．
+引数が充足していないコンストラクタ適用はクロージャになる．
+
+>|haskell|
+one :: Int
+one = 1
+
+jtrue :: Maybe Bool
+jtrue = Just True
+
+just :: a -> Just a
+just = Just
+
+-- STG
+Main.one :: GHC.Types.Int =
+    NO_CCS GHC.Types.I#! [1#];
+
+Main.jtrue :: GHC.Base.Maybe GHC.Types.Bool =
+    NO_CCS GHC.Base.Just! [GHC.Types.True];
+
+Main.just :: forall a. a -> GHC.Base.Maybe a =
+    \r [t] GHC.Base.Just [t];
+||<
+
+（NO_CCSはNo Cost Centre Stack，負荷プロファイルに使用されないというアノテーション）
+- [https://downloads.haskell.org/~ghc/7.8.3/docs/html/libraries/ghc/CostCentre.html:title=Cost Centre - ghc]
+
+** 関数適用
+
+関数へ与える引数は全て変数で，式を与える場合は予めletで一つ一つ変数に束縛する．
+
+>|haskell|
+twice :: (a -> a) -> a -> a
+twice f x = f (f x)
+
+threeTimes :: (a -> a) -> a -> a
+threeTimes f x = f (f (f x))
+
+-- STG
+Main.twice :: forall a. (a -> a) -> a -> a =
+    \r [f x]
+        let {
+          x0 :: a = \u [] f x;
+        } in  f x0;
+
+Main.threeTimes :: forall a. (a -> a) -> a -> a =
+    \r [f x]
+        let {
+          x1 :: a = \u []
+              let {
+                x0 :: a = \u [] f x;
+              } in  f x0;
+        } in f x1;
+||<
+
+** case式
+
+対象の式を評価し，パターンマッチを行う．ネストされたパターンは受け付けない．
+ofの後の変数には評価後の値を束縛する．
+
+>|haskell|
+fromMaybe :: a -> Maybe a -> a
+fromMaybe a Nothing  = a
+fromMaybe _ (Just a) = a
+
+-- STG
+Main.fromMaybe :: forall a. a -> GHC.Base.Maybe a -> a =
+    \r [a m]
+        case m of _ {
+          GHC.Base.Nothing -> a;
+          GHC.Base.Just a1 -> a1;
+        };
+||<
+
+
+** 型クラス
+
+型クラス制約付きの多相関数は，型クラス辞書（メンバ関数の実装を保持する辞書，C++の仮想関数テーブルに近い）を引数に明示的にとる．
+
+>|haskell|
+inc :: Num a => a -> a
+inc x = x + 1
+
+-- STG
+Main.inc :: forall a. GHC.Num.Num a => a -> a =
+    \r [$dNum x]
+        let {
+          num1 :: a = \u []
+              let {
+                int1 :: GHC.Integer.Type.Integer =
+                    NO_CCS GHC.Integer.Type.S#! [1#];
+              } in  GHC.Num.fromInteger $dNum int1;
+        } in  GHC.Num.+ $dNum x num1;
+||<
+
+$dNumが型クラス辞書．
+
+>|haskell|
+class Eq a where
+    (==) :: a -> a -> Bool
+    (/=) :: a -> a -> Bool
+
+data LR = L | R
+
+instance Eq LR where
+    L == L = True
+    R == R = True
+    _ == _ = False
+
+    a /= b = not (a == b)
+
+foo = L == R
+
+-- STG
+
+-- メンバ関数
+Main.== :: forall a. Main.Eq a => a -> a -> GHC.Types.Bool =
+    \r [dic]
+        case dic of _ {
+          Main.C:Eq eq _ -> eq;
+        };
+Main./= :: forall a. Main.Eq a => a -> a -> GHC.Types.Bool =
+    \r [dic]
+        case dic of _ {
+          Main.C:Eq _ neq -> neq;
+        };
+-- メンバ関数の実装
+$eqLR :: Main.LR -> Main.LR -> GHC.Types.Bool =
+    \r [a b]
+        case a of _ {
+          Main.L ->
+              case b of _ {
+                Main.L -> GHC.Types.True [];
+                Main.R -> GHC.Types.False [];
+              };
+          Main.R ->
+              case b of _ {
+                Main.L -> GHC.Types.False [];
+                Main.R -> GHC.Types.True [];
+              };
+        };
+$neqLR :: Main.LR -> Main.LR -> GHC.Types.Bool =
+    \r [a b]
+        let {
+          isEq :: GHC.Types.Bool =
+              \u [] Main.== Main.$fEqLR a b;
+        } in  GHC.Classes.not isEq;
+-- 辞書
+Main.$fEqLR :: Main.Eq Main.LR =
+    NO_CCS Main.C:Eq! [$eqLR $neqLR];
+--
+Main.foo :: GHC.Types.Bool =
+    \u [] Main.== Main.$fEqLR Main.L Main.R;
+||<
+
+型クラス辞書は単純にコンストラクタとして表現されていることが分かる．
+メンバ関数では，型クラス辞書から該当する実装を取り出すだけである．
+インスタンス宣言をすると，クラスと型に対応した辞書が作られる．
+
+
+* 実行時表現
+
+STGは実行時の動作に素直に対応する．
+- let式 - ヒープオブジェクトの生成
+- case式 - thunkを[https://wiki.haskell.org/Weak_head_normal_form:title=WHNF]まで評価して分岐
+- 関数適用 - ジャンプ
+
+** ヒープオブジェクト
+
+データ型やクロージャはヒープか静的領域に置かれ，ポインタで参照される．
+これらのオブジェクトは [header][payload..] の形をとる．
+header（infoポインタ）は静的領域の info table を指す．
+
+- [https://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/HeapObjects:title=GHC Commentary: The Layout of Heap Objects - The Glasgow Haskell Compiler]
+
+*** Info Table
+
+info table はクロージャに必要な情報を持つ．
+[layout][closure type][SRT bitmap][entry code] の形をとる．
+- layout - ガベージコレクタのために，オブジェクトのペイロードについての情報（オブジェクトのワード数，どのワードがポインタか）を持つ．
+- closure type - クロージャの種類（コンストラクタ，関数，thunk etc.）
+- SRT bitmap - 静的オブジェクトのGCのための情報（後述）
+- entry code - オブジェクトを評価（関数なら適用）するためのコード
+
+*** データコンストラクタ
+
+>||
+[header][payload..]
+||<
+haeder がコンストラクタの種類を表し，引数が続く．
+無引数のコンストラクタは静的領域に置かれる．
+
+*** 関数クロージャ
+
+>||
+[header][payload..]
+||<
+header が関数のコードを指し，自由変数（関数内で使われている変数のうち関数外かつトップレベル以外で定義された変数）が続く．
+
+*** Thunk
+
+>||
+[header][payload..]
+||<
+header が関数のコードを指し，引数が続く．
+関数との違いは更新可能であること．
+
+*** 部分適用
+
+>||
+[header][arity][no. of words][function closure][payload..]
+||<
+関数適用のうち引数が足りないもの．
+- arity - 残りの引数の数
+- no. of words - すでに適用された引数の数
+- function closure - 関数クロージャ
+- payload - すでに適用された引数
+
+*** Selector thunk
+
+>||
+[header][pointer]
+||<
+コンストラクタから一部を取り出すだけのthunk. 例：
+>|haskell|
+case x of (a,b) -> a
+||<
+
+*** 間接参照
+
+>||
+[header][target closure]
+||<
+間接参照は対象のポインタを持つだけである．
+更新可能クロージャは評価されると，結果を指す間接参照に書き換えられる（クロージャをサイズ不定なオブジェクトで直接書き換えると複雑になるため）．
+
+
+その他組み込みのデータ型がある．
+
+
+** ガベージコレクト
+
+*** Constant Applicative Forms
+[https://wiki.haskell.org/Constant_applicative_form:title=Constant applicative form] (定作用形，CAF) は，スーパーコンビネータ(*1)のうちλ抽象"でない"ものを指す．
+自由変数を含まないことから，CAFはつねにトップレベルの（環境に依存しない）関数になる．よってCAFはこれを参照する他の式から共有され，一度きりの評価で済む．
+
+(*1) [https://wiki.haskell.org/Super_combinator:title=Super combinator]
+自由変数（引数でない変数）を含まない式のみから成り立つ式．
+
+>|haskell|
+-- スーパーコンビネータ
+0
+\x y -> x + y
+\f -> f (\x -> x + x)
+
+-- スーパーコンビネータでない（λ抽象内で，引数以外の変数y,gが現れている）
+\x -> y + x
+\f g -> f (\x -> g 2 x)
+||<
+
+CAF自体は静的領域に置かれるが，評価後の式の一部はヒープに置かれ，巨大なものかもしれない．GCはこれを追跡する必要がある．
+
+*** Static Reference Table
+
+静的クロージャのうちCAFを（あるいは間接に）参照しているものをCAFFYと呼ぶ．
+全ての info table は Static Reference Table（静的参照テーブル，SRT）を持ち，そのクロージャが参照するCAFFYをリストする（実際はビットマスクで管理）．
+
+>|haskell|
+foo :: a -> a
+foo = id
+
+-- STG
+Main.foo :: forall a_aoZ. a_aoZ -> a_aoZ
+[GblId, Str=DmdType] =
+    \u srt:SRT:[r2A :-> GHC.Base.id] [] GHC.Base.id;
+||<
+STG中の srt:SRT:[r2A :-> GHC.Base.id] がSRTを表す．GHC.Base.idを参照していることが明記されている．
+
+- [https://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC/CAFs:title=GHC Commentary: Garbage Collecting CAFs - The Glasgow Haskell Compiler]
+
+
+* 参照
+
+- [https://ghc.haskell.org/trac/ghc/wiki/Commentary/Compiler/GeneratedCode:title=I know kung fu: learning STG by example - The Glasgow Haskell Compiler]
+- [https://ghc.haskell.org/trac/ghc/wiki/Commentary/Compiler/StgSynType:title=The STG syntax data types - The Glasgow Haskell Compiler]
+- [http://blog.ezyang.com/2011/04/tracing-the-compilation-of-hello-factorial/:title=Tracing the compilation of Hello Factorial! - Inside 245-5D]
+- [http://d.hatena.ne.jp/suztomo/20111224/1324718354:title=Haskellのコンパイル中に現れるSTGと, GDBで見るC-backendなC-- - suztomoの日記]
+- [http://www.kotha.net/hperf/ghc.html:title=GHCのこと - kotha.net]

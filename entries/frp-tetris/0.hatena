@@ -1,0 +1,343 @@
+FRP（Functional Reactive Programming）というスタイルがある．入力から出力を得る（あらゆる）プログラムを関数風に表現する手法らしい．遅延ストリームは純粋関数型言語にぴったりだと感じるが，あまり流行っていないような気がする．
+
+HaskellではFRPのライブラリが複数あるそうだが，よく分からないのでボトムアップに自作してみよう．ゲームといえば入出力と内部状態の塊，楽しそうなのでCUIで動くテトリスを題材とする．
+
+
+* 基本
+
+FRPにはEventとBehaviorという概念がある．
+Eventは，時間と値の組のリストで，離散的なイベントを表す．例えば，キーが押されたというイベント，画面が更新されたというイベントなど．
+Behaviorは時間の関数で，連続的な値を表す．例えば，経過時間や現在のスコアなど．
+
+>|haskell|
+type Time = Double
+newtype Event a = Event [(Time, a)]
+newtype Behavior a = Behavior (Time -> a)
+||<
+
+====
+
+* Event
+
+テトリスに必要なのは文字列の入出力程度なので，プログラムは文字のイベントとして表現する．例えば ，
+
+>|haskell|
+[(0, 'A'), (1000, 'B'), (2000, 'C')]
+||<
+
+このようなイベントを実行すると，まず'A'，1000ms後に'B'，2000ms後に'C'が出力されるものとしよう．
+実行する関数を作る．
+ 
+>|haskell|
+import Control.Concurrent
+import Control.Monad
+import System.IO
+
+data Output = Put Char
+
+run :: Event Output -> IO ()
+run (Event o) = foldM_
+    (\t (t', Put c) -> do
+        threadDelay . truncate $ (t' - t) * 1000
+        putChar c
+        hFlush stdout
+        return t'
+    ) 0 o
+
+main :: IO ()
+main = run $ Event [(0, Put 'A'), (1000, Put 'B'), (2000, Put 'C')]
+||<
+
+>||
+ABC
+||<
+
+時間と文字のリストを表示していく．一つ前のイベントとの差分時間だけ待機したのち，文字を出力するのを繰り返す．
+例えばイベントが，
+
+>|haskell|
+main :: IO ()
+main = run $ Event [(t * 1000, Put 'A') | t <- [0..]]
+||<
+
+>||
+AAAAA ...
+||<
+
+このように無限リストでも問題ない．遅延評価のおかげで1秒ごとに'A'を延々表示し続けることができる．
+
+使いやすいように，いくつか関数を定義しておこう．
+
+>|haskell|
+{-# LANGUAGE TupleSections #-}
+
+puts :: Event String -> Event Output
+puts (Event xs) = Event $ foldr (\(t, s) ys -> map ((t,) . Put) s ++ ys) [] xs
+
+atTime :: Time -> Event ()
+atTime t = Event [(t, ())]
+
+atTimes :: [Time] -> Event ()
+atTimes ts = Event $ map (, ()) ts
+||<
+
+putsは，文字列のイベントを変換して文字出力に使えるようにする．
+atTimeは一回きり，atTimesは複数回の時間から何もしないイベントを生成する．EventをFunctorのインスタンスとし．これに値を被せれば，
+
+>|haskell|
+import Control.Arrow
+
+instance Functor Event where
+    f `fmap` Event xs = Event $ map (second f) xs
+
+main :: IO ()
+main = run $ const (Put 'A') <$> atTimes [1,1000..]
+||<
+
+>||
+AAAAA ...
+||<
+
+
+* Behavior
+
+ゲームをプログラムに落とし込む時，普通なら一定間隔で画面を書き換えると考えるかもしれない．だがここでは，ゲーム画面は連続的な状態をとり，それをサンプリングして表示するようにして実装を分離しよう．表示部分はEventだが，ゲーム自体はBehaviorとなる．
+
+>|haskell|
+instance Functor Behavior where
+    f `fmap` Behavior g = Behavior $ f . g
+
+snapshot :: Behavior b -> Event a -> Event (a, b)
+snapshot (Behavior f) (Event xs) = Event $ map (\(t, b) -> (t, (b, f t))) xs
+
+time :: Behavior Time
+time = Behavior id
+
+
+frames :: Event ()
+frames = atTimes [0,100..]
+
+view :: Behavior String
+view = (++ "\n") . show <$> time
+
+main :: IO ()
+main = run . puts $ snd <$> view `snapshot` frames
+||<
+
+>||
+0.0
+100.0
+200.0
+300.0
+...
+||<
+
+snapshotは，BehaviorをEventでサンプリングし，結果をタプルのイベントとして返す．
+timeは現在の時間を表すBehaviorだ．
+ゲーム画面は文字列のBehaviorとし，フレームのイベントでサンプリングする度に出力する．
+ここでは，ゲームは経過時間を表示するBehaviorとなっている．
+
+
+* Eventの合成
+
+今は出力がだらだらと表示されるが，ゲームなのでフレームごとに画面をクリアしたい．コマンドを追加する．
+
+>|haskell|
+import System.Console.ANSI
+
+data Output = Put Char
+            | Clear
+
+run :: Event Output -> IO ()
+run (Event o) = foldM_
+    (\t (t', o) -> do
+        threadDelay . truncate $ (t' - t) * 1000
+        case o of
+            Put c -> do
+                putChar c
+                hFlush stdout
+            Clr -> clearScreen
+        return t'
+    ) 0 o
+
+clearView :: Event Output
+clearView = const Clr <$> frames
+||<
+
+フレーム毎に画面をクリアするclearViewイベントができた．
+これを先ほどのゲーム画面を出力するイベントと合成したい．
+
+2つのEventを合成すると，時間順に並んだひとつのEventになれば便利だ．EventをMonoidのインスタンスにする．
+
+>|haskell|
+instance Monoid (Event a) where
+    mempty = Event []
+    Event as `mappend` Event bs = Event $ go as bs
+        where
+            go ((t, a):xs) ((t', b):ys) =
+                if t <= t' then (t,  a): go xs ((t', b):ys)
+                           else (t', b): go ((t, a):xs) ys
+
+clearDisplay :: Event Output
+clearDisplay = const Clr <$> frames
+
+gameDisplay :: Event Output
+gameDisplay = puts $ snd <$> view `snapshot` frames
+
+main :: IO ()
+main = run $ clearDisplay `mappend` gameDisplay
+||<
+
+同時のイベントは左辺が先になる．フレーム毎に，画面がクリアされてから新しい画面が出力されるようになった．
+
+
+* テトリスのデータ
+
+** フィールド
+
+テトリスのフィールドを表示させる．これまでの関数を使って，
+
+>|haskell|
+data Tetris = Tetris {field :: [[Cell]],
+                      score :: Integer}
+
+instance Show Tetris where
+    show (Tetris f s) = "score: " ++ show s ++ "\n" ++
+                        unlines (map (concatMap show) f)
+
+data Cell = E | B | W deriving Eq -- Empty, Block, Wall
+
+instance Show Cell where
+    show E = "  "
+    show B = "██"
+    show W = "▒▒"
+
+fieldWidth  = 10
+fieldHeight = 20
+
+initialField = replicate fieldHeight ([W] ++ replicate fieldWidth E ++ [W])
+               ++ [replicate (fieldWidth + 2) W]
+
+game :: Behavior Tetris
+game = Tetris initialField . truncate <$> time
+
+view :: Behavior String
+view = show <$> game
+||<
+
+>||
+score: 0
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+||<
+
+
+** テトリミノ
+
+テトリミノ（ブロック）を表示，落下させる．
+左上が原点で，横軸がx・縦軸がyとする．
+
+>|haskell|
+data Tetris = Tetris {field :: [[Cell]],
+                      tetrimino :: [[Cell]],
+                      pos :: (Int, Int),
+                      score :: Int}
+instance Show Tetris where
+    show (Tetris f t p s) =
+        "score: " ++ show s ++ "\n" ++
+        unlines (map (concatMap show) $ merge p t f)
+
+merge :: (Int, Int) -> [[Cell]] -> [[Cell]] -> [[Cell]]
+merge (x,y) t = let ps = map ((+) x *** (+) y) $ blocks t
+                in mapWithPos (\p c -> if p `elem` ps then B else c)
+    where
+        blocks :: [[Cell]] -> [(Int, Int)]
+        blocks cs = concatMap (\(y, xs) -> map (,y) xs) $
+            indexed $ map (map fst . filter ((== B) . snd) . indexed) cs
+
+        indexed :: [a] -> [(Int, a)]
+        indexed = zip [0..]
+
+        mapWithPos :: ((Int, Int) -> a -> b) -> [[a]] -> [[b]]
+        mapWithPos f ass = map (\(y, as) ->
+                               map (\(x, a) -> f (x, y) a) $ zip [0..] as)
+                           $ zip [0..] ass
+
+initialField = replicate fieldHeight
+                    ([W] ++ replicate fieldWidth E ++ [W])
+               ++ [replicate (fieldWidth + 2) W]
+
+tetriminoS = [[E,E,E,E],
+              [E,B,B,E],
+              [B,B,E,E],
+              [E,E,E,E]]
+
+game :: Behavior Tetris
+game = (\t -> Tetris initialField tetriminoS (5, truncate (t / 1000) - 2) 0)
+       <$> time
+||<
+
+>||
+score: 0
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒          ████      ▒▒
+▒▒        ████        ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒                    ▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+||<
+
+y座標を時間に対応させて，S字のテトリミノが落ちていくようになった．
+ゲーム状態のBehaviorからshow関数でゲーム画面を得ている．
+
+それぞれの関数は純粋でも，状態変化を扱うことができた．
+
+今回はここまで．
+
+
+* 参考
+
+[http://maoe.hatenadiary.jp/entry/2012/12/24/011414:title]
+
+[http://maoe.hatenadiary.jp/entry/20100109/1263059731:title]
+
+[https://hackage.haskell.org/package/reactive-0.11.5:title]
+
+
+*今回のソース
+
+[https://gist.github.com/f53f67b13705e4fc5921a64339c429dc:embed#gistf53f67b13705e4fc5921a64339c429dc]
