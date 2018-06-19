@@ -1,0 +1,121 @@
+定理証明支援系ができるまで(0)型無しλ計算
+
+
+定理証明支援系に興味を持ったが，特に証明したい定理があるとか数学に生かしたいといった目的はないので，仕組みを知るためにゼロから作ってみる．定理証明支援系といっても様々だが，ここでは主にCoqを念頭において話を進める．
+
+* 目次
+(0)型無しλ計算
+
+
+* 型無しλ計算
+
+お馴染みのλ計算である．型はまだ無い．
+
+以下の実装はIdrisで書かれている(ほぼHaskellと思って問題ない)．パーサ・表示部分は省略する．
+
+====
+
+** 構文
+
+変数・λ抽象・関数適用の3種類の項からなる．
+>||
+t ::=    項
+  x      変数
+  λx. t  λ抽象
+  t t    関数適用
+||<
+λ抽象 λx. t の項tの中において，変数xは束縛されている(xはtをスコープにもつ)．束縛されていない変数の出現は<strong>自由</strong>であるという．
+
+これ以降の定義は抽象構文を対象とし，括弧や空白は適宜解釈されるものとする．
+
+** 操作
+
+*** β簡約
+
+λ式における計算とは，関数適用ただそれのみである．
+\begin{align}
+(\lambda x . t) \, u \longrightarrow [ x \mapsto u ] \, t
+\end{align}
+ここで [tex: \[ x \mapsto u \] \, t ] はt中のxの自由な出現をすべてuで書き換えることを表す．この操作を<strong>β簡約</strong>という．
+これ以上簡約できないλ式は<strong>正規形</strong>であるという．
+
+*** 評価順序
+
+式中のどの簡約可能な関数適用(簡約基と呼ぶ)から簡約しても，同じλ式を得られる(Church–Rosser性)．
+評価戦略によって，
+- 完全β簡約...任意の簡約基がいつでも簡約され得る
+- 正規順序...もっとも左かつ外側の簡約基から簡約される
+- 名前呼び...正規順序でかつ抽象の内部での簡約を許さない．必要呼び((実装上は，一度評価した式を再利用するという違いがある．))，遅延評価ともいう．
+- 値呼び...外側の簡約基から簡約されるが，その前に簡約基の右側を簡約する．正格な評価戦略である．
+値呼びにおいて引数は関数に渡されるときに評価され(正格)，名前呼びにおいて引数は実際に必要になったときだけ評価される(非正格)．
+
+*** α変換
+
+束縛変数の名前は問わない，つまりλ式に出現するある変数名を全て別の変数名に置換しても等価である．
+ただしこれには条件があり，たとえば以下の例は明らかに誤りである．
+\begin{align}
+[x \mapsto y](\lambda x. x) \longrightarrow \lambda x. y \tag{0} \\
+[x \mapsto y](\lambda y. x) \longrightarrow \lambda y. y \tag{1}
+\end{align}
+すなわち，
+(0)代入は自由な出現に対してのみ有効である．
+(1)代入する項の中の自由変数が新たに束縛(捕獲)されないこと．不可能な場合は束縛変数の名前をα変換により置換してもよい．
+
+** データ型
+
+λ計算ではこれだけであらゆるデータ型(Bool値，自然数，組，リスト etc.)を表現できる.
+ここでは省略する．
+
+** 実装
+
+簡約の実装にはいくつかの方法が存在する．
+定義通り変数を全て書き換えていくこともできるが，上に述べたように少々厄介な条件があるため，ここでは<strong>環境</strong>を用いた方法をとる．環境は束縛変数と代入項の組を含み，親(1つ外側)の環境に連なる．さらに環境を保持する項としてクロージャを導入する．
+名前呼び戦略を採用している．
+
+>|haskell|
+Name : Type
+Name = String
+
+Expr : Type
+Envir : Type
+
+data Expr = Var Name
+          | Abs Name Expr
+          | App Expr Expr
+          | Cls Envir Expr
+
+data Envir = Root
+           | Sub Name Expr Envir
+
+lookup : Name -> Envir -> Maybe Expr
+lookup x Root        = Nothing
+lookup x (Sub y e p) = if x == y then Just e else lookup x p
+
+eval : Envir -> Expr -> (Envir, Expr)
+eval env e = case e of
+    Var s   => maybe (env, e) (eval env) $ lookup s env
+    App a b => case eval env a of
+        (env', Abs s c) => eval (Sub s (Cls env b) env') c
+        (env', a')      => (env, App (Cls env' a') b)
+    Cls env' a => eval env' a
+    _       => (env, e)
+||<
+
+>||
+> (λf.λx.f x) (λx.x) a
+a
+> (λy.λz.y y z) (λx.x) x
+x
+||<
+
+シンプル．
+
+[https://github.com/fujiy00/howard/tree/untyped:title=今回のソースコード]
+
+
+次回(1)型付きλ計算
+
+
+* 参考文献
+
+- Benjamin C. Pierce『型システム入門』(住井英二郎 監訳) オーム社
