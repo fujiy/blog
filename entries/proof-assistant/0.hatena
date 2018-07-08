@@ -4,7 +4,8 @@
 定理証明支援系に興味を持ったが，特に証明したい定理があるとか数学に生かしたいといった目的はないので，仕組みを知るためにゼロから作ってみる．定理証明支援系といっても様々だが，ここでは主にCoqを念頭において話を進める．
 
 * 目次
-(0)型無しλ計算
+(0)型無しラムダ計算 <<
+(1)[https://fujiy.hatenablog.com/entry/proof-assistant-1:title=単純型付きラムダ計算]
 
 
 * 型無しλ計算
@@ -113,7 +114,7 @@ x
 [https://github.com/fujiy00/howard/tree/untyped:title=今回のソースコード]
 
 
-次回(1)型付きλ計算
+次回(1)[https://fujiy.hatenablog.com/entry/proof-assistant-1:title=単純型付きラムダ計算]
 
 
 * 参考文献
