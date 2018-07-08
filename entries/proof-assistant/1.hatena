@@ -1,0 +1,153 @@
+定理証明支援系ができるまで(1)単純型付きλ計算
+
+* 単純型付きλ計算
+
+λ計算では自然数やデータ型をも表現できるが，プログラムが常に意味のある結果になるとは限らない(行き詰まり状態．例えば true + 1 とは？)．式を実際に評価することなしに，プログラムの振る舞いをできる限り保証したいというのは自然な動機である．
+項の種類を表すものとして<strong>型</strong>を導入し，評価前に型検査を行う．
+
+====
+
+** 型付け
+
+項tが型Tを持つことを[tex: t \colon T]と表す．このときtは型付け可能であるといい，その型Tは一意である．
+
+** 安全性
+
+正しく型付けされた項は不正な結果にならないという性質を安全性(健全性)という．すなわち，
+- 進行定理・・・正しく型付けされた項は行き詰まり状態にならない(正規形か評価途中である)
+- 保存定理・・・正しく型付けされた項が評価できるならば，それを評価した項も正しく型付けされる．
+の2つの性質を持つ．
+
+** 構文
+
+最低限の基本的な型としてUnit(何の意味も持たない)を追加する(基本型を持たない単純型付きλ計算には，正しく型付けされた項がない)．型は基本型か関数型からなる．
+λ抽象の束縛変数は出現時点では型が分からないため，明示的な型注釈を必要とする．
+
+>||
+t ::=      項
+  x        変数
+  λx:T. t  λ抽象
+  t t      関数適用
+  unit     unit値
+
+T ::=      型
+  T → T    関数型
+  Unit     Unit型
+||<
+
+** 型付け規則
+
+型環境(型付け文脈)Γは，λ抽象で導入された変数と型の組の集合であり，その元で束縛変数の型が定まる．
+λ抽象は引数をとって本体を返す関数型，関数適用は仮引数と実引数の型が等しい上で戻り値の型をとる．
+
+\begin{align}
+\frac
+{ x \colon T \in \Gamma }
+{ \Gamma \vdash x \colon T }
+\tag{Var}
+\end{align}
+\begin{align}
+\frac
+{\Gamma , x \colon T_1 \vdash t \colon T_2}
+{\Gamma \vdash (\lambda x \colon T_1 . t) \colon T_1 \to T_2}
+\tag{Abs}
+\end{align}
+\begin{align}
+\frac
+{\Gamma \vdash f \colon T_1 \to T_2 \quad
+ \Gamma \vdash t \colon T_1 }
+{\Gamma \vdash (f \; t) \colon T_2}
+\tag{App}
+\end{align}
+\begin{align}
+unit \colon Unit \\
+\tag{Unit}
+\end{align}
+
+** 実装
+
+型検査時には型環境を持ち回り，λ抽象で新たな変数が導入されるときその内側では拡張された型環境を元に型検査が行われる．
+
+>|haskell|
+-- Data Types
+
+Name : Type
+Name = String
+
+Expr : Type
+Envir : Type
+
+data TypE = Arr TypE TypE
+          | TUnit
+
+data Param = Prm Name TypE
+
+data Expr = Var Name
+          | Abs Param Expr
+          | App Expr Expr
+          | Cls Envir Expr
+          | EUnit
+
+data Envir = Root
+           | Sub Name Expr Envir
+
+data TypeError = UnboundVar Expr
+               | Mismatch Expr TypE TypE
+
+-- Type checker
+
+TypeEnv : Type
+TypeEnv = List (Name, TypE)
+
+equal : TypE -> TypE -> Bool
+equal (Arr ax ay) (Arr bx by) = equal ax bx && equal ay by
+equal TUnit TUnit = True
+equal _ _         = False
+
+typeCheck : TypeEnv -> Expr -> Either TypeError TypE
+typeCheck te e = case e of
+    EUnit   => Right TUnit
+    Var s   => maybeToEither (UnboundVar e) $ lookup s te
+    App a b => do
+        ta <- typeCheck te a
+        tb <- typeCheck te b
+        case ta of
+            Arr x y =>
+                if equal x tb then Right tb
+                              else Left $ Mismatch e x tb
+            _ => Left $ Mismatch e (Arr tb TUnit) ta
+    Abs (Prm s t) a => do
+        ta <- typeCheck ((s, t) :: te) a
+        Right $ Arr t ta
+
+-- Interpreter
+...
+||<
+
+>||
+> unit
+unit : Unit
+unit
+> λx:Unit.x
+(λx: Unit.x) : Unit → Unit
+λx: Unit.x
+> (λf:Unit→Unit.f unit) unit
+error: Couldn't match expected type Unit → Unit with actual type Unit
+> (λf:Unit→Unit. λx:Unit.f x) (λx:Unit.x) unit
+((λf: (Unit → Unit).λx: Unit.f x) (λx: Unit.x) unit) : Unit
+unit
+||<
+
+型付け可能であるのときのみ評価するようになった．
+
+[https://github.com/fujiy00/howard/tree/typed:title=今回のソースコード]
+
+* 目次
+定理証明支援系ができるまで
+(0)[https://fujiy.hatenablog.com/entry/proof-assistant-0:title=型無しラムダ計算]
+(1)単純型付きラムダ計算 <<
+(2)構文拡張と代数的データ型
+
+* 参考文献
+
+- Benjamin C. Pierce『型システム入門』(住井英二郎 監訳) オーム社
